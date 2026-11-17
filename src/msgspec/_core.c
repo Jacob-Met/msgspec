@@ -2870,6 +2870,8 @@ AssocList_Sort(AssocList* list) {
 #define MS_TYPE_NAMEDTUPLE          (1ull << 35)
 #define MS_TYPE_BOOLLITERAL_TRUE    (1ull << 36)
 #define MS_TYPE_BOOLLITERAL_FALSE   (1ull << 37)
+/* Distinct-length fixed tuples sharing one compiled union. */
+#define MS_TYPE_FIXTUPLE_UNION      (1ull << 40)
 // Despite the fact that `frozendict` was added in 3.15,
 // this type is always defined for order consistency:
 #define MS_TYPE_FROZENDICT          ((1ull << 38) | (1ull << 39))
@@ -5362,8 +5364,231 @@ invalid:
     goto done;
 }
 
+/* JSON wire signatures conservatively group types with overlapping encodings. */
+#define MS_KIND_NULL 1
+#define MS_KIND_BOOL 2
+#define MS_KIND_NUM 4
+#define MS_KIND_STR 8
+#define MS_KIND_ARR 16
+#define MS_KIND_MAP 32
+#define MS_KIND_ANY 63
+
+static MS_INLINE int
+TypeNode_wire_kinds(TypeNode *type) {
+    uint64_t t = type->types;
+    if (t & (MS_TYPE_ANY | MS_TYPE_CUSTOM | MS_TYPE_CUSTOM_GENERIC | MS_TYPE_EXT))
+        return MS_KIND_ANY;
+    int m = 0;
+    if (t & MS_TYPE_NONE) m |= MS_KIND_NULL;
+    if (t & (MS_TYPE_BOOL | MS_TYPE_BOOLLITERAL_TRUE | MS_TYPE_BOOLLITERAL_FALSE))
+        m |= MS_KIND_BOOL;
+    if (t & (MS_TYPE_INT | MS_TYPE_FLOAT | MS_TYPE_INTENUM | MS_TYPE_INTLITERAL))
+        m |= MS_KIND_NUM;
+    if (t & (MS_TYPE_STR | MS_TYPE_STRLITERAL | MS_TYPE_ENUM |
+             MS_TYPE_BYTES | MS_TYPE_BYTEARRAY | MS_TYPE_MEMORYVIEW |
+             MS_TYPE_DATETIME | MS_TYPE_DATE | MS_TYPE_TIME |
+             MS_TYPE_TIMEDELTA | MS_TYPE_UUID))
+        m |= MS_KIND_STR;
+    if (t & MS_TYPE_DECIMAL) m |= MS_KIND_NUM | MS_KIND_STR;
+    if (t & (MS_TYPE_LIST | MS_TYPE_SET | MS_TYPE_FROZENSET |
+             MS_TYPE_VARTUPLE | MS_TYPE_FIXTUPLE | MS_TYPE_NAMEDTUPLE |
+             MS_TYPE_STRUCT_ARRAY | MS_TYPE_STRUCT_ARRAY_UNION))
+        m |= MS_KIND_ARR;
+    if (t & (MS_ANY_DICT | MS_TYPE_STRUCT | MS_TYPE_STRUCT_UNION |
+             MS_TYPE_TYPEDDICT | MS_TYPE_DATACLASS))
+        m |= MS_KIND_MAP;
+    return m ? m : MS_KIND_ANY;
+}
+
+static MS_INLINE int
+TypeNode_tuple_first_kind(TypeNode *branch) {
+    Py_ssize_t offset, size;
+    TypeNode_get_fixtuple(branch, &offset, &size);
+    return size ? TypeNode_wire_kinds(branch->details[offset].pointer) : 0;
+}
+
+/* Compile disjoint tuple shapes into prevalidated fixed-array branches.
+ * Existing tuple decoders perform per-element typed validation. */
+static TypeNode *
+TypeNode_Convert_tuple_union(PyObject *obj, int *matched) {
+    MsgspecState *mod = msgspec_get_global_state();
+    PyObject *origin = NULL, *args = NULL;
+    TypeNode **branches = NULL, *out = NULL;
+    Py_ssize_t nbranches = 0, nargs;
+    uint64_t optional_none = 0;
+    bool entered_recursion = false;
+    *matched = 0;
+
+    /* Most annotations are non-union scalars and builtin generic aliases.
+     * Avoid doing dynamic attribute lookup for these hot conversion paths. */
+    if (PyType_Check(obj) || Py_TYPE(obj) == &Py_GenericAliasType) {
+        return NULL;
+    }
+    if (Py_TYPE(obj) != (PyTypeObject *)mod->types_uniontype) {
+        origin = PyObject_GetAttr(obj, mod->str___origin__);
+        if (origin == NULL) {
+            PyErr_Clear();
+            return NULL;
+        }
+        if (origin != mod->typing_union) goto done;
+    }
+    args = PyObject_GetAttr(obj, mod->str___args__);
+    if (args == NULL || !PyTuple_Check(args)) {
+        PyErr_Clear();
+        goto done;
+    }
+    nargs = PyTuple_GET_SIZE(args);
+    if (nargs < 2) goto done;
+    if (Py_EnterRecursiveCall(" while analyzing tuple union types")) {
+        *matched = -1;
+        goto done;
+    }
+    entered_recursion = true;
+    branches = PyMem_Calloc(nargs, sizeof(TypeNode *));
+    if (branches == NULL) {
+        PyErr_NoMemory();
+        *matched = -1;
+        goto done;
+    }
+
+    for (Py_ssize_t i = 0; i < nargs; i++) {
+        TypeNode *branch = TypeNode_Convert(PyTuple_GET_ITEM(args, i));
+        if (branch == NULL) {
+            *matched = -1;
+            goto done;
+        }
+        if (branch->types == MS_TYPE_NONE) {
+            optional_none = MS_TYPE_NONE;
+            TypeNode_Free(branch);
+            continue;
+        }
+        if (!(branch->types & MS_TYPE_FIXTUPLE) ||
+            (branch->types & ~(MS_TYPE_FIXTUPLE | MS_ARRAY_CONSTRS))) {
+            TypeNode_Free(branch);
+            goto done;
+        }
+        Py_ssize_t offset, length;
+        TypeNode_get_fixtuple(branch, &offset, &length);
+        for (Py_ssize_t j = 0; j < nbranches; j++) {
+            Py_ssize_t old_offset, old_length;
+            TypeNode_get_fixtuple(branches[j], &old_offset, &old_length);
+            if (length == old_length &&
+                (length == 0 ||
+                 (TypeNode_tuple_first_kind(branch) &
+                  TypeNode_tuple_first_kind(branches[j])))) {
+                /* Equal lengths require disjoint first-value wire signatures. */
+                TypeNode_Free(branch);
+                goto done;
+            }
+        }
+        branches[nbranches++] = branch;
+    }
+    if (nbranches < 2) goto done;
+
+    out = PyMem_Calloc(
+        1, sizeof(TypeNode) + (nbranches + 1) * sizeof(TypeDetail)
+    );
+    if (out == NULL) {
+        PyErr_NoMemory();
+        *matched = -1;
+        goto done;
+    }
+    out->types = MS_TYPE_FIXTUPLE | MS_TYPE_FIXTUPLE_UNION | optional_none;
+    out->details[0].py_ssize_t = nbranches;
+    for (Py_ssize_t i = 0; i < nbranches; i++) {
+        out->details[i + 1].pointer = branches[i];
+        branches[i] = NULL;
+    }
+    *matched = 1;
+
+done:
+    if (branches != NULL) {
+        for (Py_ssize_t i = 0; i < nbranches; i++) {
+            TypeNode_Free(branches[i]);
+        }
+        PyMem_Free(branches);
+    }
+    Py_XDECREF(args);
+    Py_XDECREF(origin);
+    if (entered_recursion) Py_LeaveRecursiveCall();
+    return out;
+}
+
+static MS_INLINE TypeNode *
+TypeNode_select_fixtuple_union(
+    TypeNode *type, Py_ssize_t length, int first_kind
+) {
+    Py_ssize_t offset, n;
+    TypeNode_get_fixtuple(type, &offset, &n);
+    TypeNode *first = NULL;
+    bool shared_length = false;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        TypeNode *branch = type->details[offset + i].pointer;
+        Py_ssize_t off, len;
+        TypeNode_get_fixtuple(branch, &off, &len);
+        if (len != length) continue;
+        if (first != NULL) shared_length = true;
+        first = branch;
+    }
+    if (!shared_length) return first;
+    for (Py_ssize_t i = 0; i < n; i++) {
+        TypeNode *branch = type->details[offset + i].pointer;
+        Py_ssize_t off, len;
+        TypeNode_get_fixtuple(branch, &off, &len);
+        if (len == length &&
+            (TypeNode_tuple_first_kind(branch) & first_kind)) return branch;
+    }
+    return NULL;
+}
+
+static MS_INLINE int
+ms_json_wire_kind(unsigned char c) {
+    if (c == 'n') return MS_KIND_NULL;
+    if (c == 't' || c == 'f') return MS_KIND_BOOL;
+    if (c == '-' || (c >= '0' && c <= '9')) return MS_KIND_NUM;
+    if (c == '"') return MS_KIND_STR;
+    if (c == '[') return MS_KIND_ARR;
+    if (c == '{') return MS_KIND_MAP;
+    return 0;
+}
+
+static MS_INLINE int
+ms_mpack_wire_kind(const char *pos, const char *end) {
+    if (pos == end) return 0;
+    unsigned char c = *pos;
+    if (c == 0xc0) return MS_KIND_NULL;
+    if (c == 0xc2 || c == 0xc3) return MS_KIND_BOOL;
+    if (c <= 0x7f || c >= 0xe0 ||
+        (c >= 0xca && c <= 0xd3)) return MS_KIND_NUM;
+    if ((c >= 0xa0 && c <= 0xbf) ||
+        (c >= 0xc4 && c <= 0xc6) ||
+        (c >= 0xd9 && c <= 0xdb)) return MS_KIND_STR;
+    if ((c >= 0x90 && c <= 0x9f) || c == 0xdc || c == 0xdd)
+        return MS_KIND_ARR;
+    if ((c >= 0x80 && c <= 0x8f) || c == 0xde || c == 0xdf)
+        return MS_KIND_MAP;
+    return 0;
+}
+
+static MS_INLINE int
+ms_convert_wire_kind(PyObject *obj) {
+    if (obj == Py_None) return MS_KIND_NULL;
+    if (PyBool_Check(obj)) return MS_KIND_BOOL;
+    if (PyLong_Check(obj) || PyFloat_Check(obj)) return MS_KIND_NUM;
+    if (PyUnicode_Check(obj) || PyBytes_Check(obj) ||
+        PyByteArray_Check(obj) || PyMemoryView_Check(obj)) return MS_KIND_STR;
+    if (PyList_Check(obj) || PyTuple_Check(obj) ||
+        PySet_Check(obj) || PyFrozenSet_Check(obj)) return MS_KIND_ARR;
+    if (PyDict_Check(obj)) return MS_KIND_MAP;
+    return 0;
+}
+
 static TypeNode *
 TypeNode_Convert(PyObject *obj) {
+    int matched = 0;
+    TypeNode *tuple_union = TypeNode_Convert_tuple_union(obj, &matched);
+    if (matched != 0) return tuple_union;
+
     TypeNode *out = NULL;
     TypeNodeCollectState state = {0};
     state.mod = msgspec_get_global_state();
@@ -16438,6 +16663,18 @@ mpack_decode_array(
     else if (type->types & MS_TYPE_VARTUPLE) {
         return mpack_decode_vartuple(self, size, TypeNode_get_array(type), path, is_key);
     }
+    else if (type->types & MS_TYPE_FIXTUPLE_UNION) {
+        TypeNode *branch = TypeNode_select_fixtuple_union(
+            type, size, ms_mpack_wire_kind(self->input_pos, self->input_end)
+        );
+        if (MS_UNLIKELY(branch == NULL)) {
+            ms_raise_validation_error(
+                path, "Expected array matching a supported tuple shape, got length %zd%U", size
+            );
+            return NULL;
+        }
+        return mpack_decode_fixtuple(self, size, branch, path, is_key);
+    }
     else if (type->types & MS_TYPE_FIXTUPLE) {
         return mpack_decode_fixtuple(self, size, type, path, is_key);
     }
@@ -18952,6 +19189,54 @@ json_decode_struct_array_union(
     return json_decode_struct_array_inner(self, info, path, 1);
 }
 
+/* Scan an array with the strict JSON skipper to find its shape before the
+ * fully typed decode. Lookahead allocates no decoded Python containers. */
+static PyObject *
+json_decode_fixtuple_union(
+    JSONDecoderState *self, TypeNode *type, PathNode *path
+) {
+    const char *start = self->input_pos;
+    unsigned char c;
+    Py_ssize_t length = 0;
+    int first_kind = 0;
+    bool first = true;
+    self->input_pos++;  /* Skip '[' */
+    while (true) {
+        if (!json_peek_skip_ws(self, &c)) return NULL;
+        if (c == ']') {
+            self->input_pos++;
+            break;
+        }
+        if (c == ',' && !first) {
+            self->input_pos++;
+            if (!json_peek_skip_ws(self, &c)) return NULL;
+        }
+        else if (first) {
+            first = false;
+        }
+        else {
+            json_err_invalid(self, "expected ',' or ']'");
+            return NULL;
+        }
+        if (c == ']') {
+            json_err_invalid(self, "trailing comma in array");
+            return NULL;
+        }
+        if (length == 0) first_kind = ms_json_wire_kind(c);
+        if (json_skip(self) < 0) return NULL;
+        length++;
+    }
+    TypeNode *branch = TypeNode_select_fixtuple_union(type, length, first_kind);
+    if (MS_UNLIKELY(branch == NULL)) {
+        ms_raise_validation_error(
+            path, "Expected array matching a supported tuple shape, got length %zd%U", length
+        );
+        return NULL;
+    }
+    self->input_pos = start;
+    return json_decode_fixtuple(self, branch, path);
+}
+
 static PyObject *
 json_decode_array(
     JSONDecoderState *self, TypeNode *type, PathNode *path
@@ -18968,6 +19253,9 @@ json_decode_array(
     }
     else if (type->types & MS_TYPE_VARTUPLE) {
         return json_decode_vartuple(self, type, TypeNode_get_array(type), path);
+    }
+    else if (type->types & MS_TYPE_FIXTUPLE_UNION) {
+        return json_decode_fixtuple_union(self, type, path);
     }
     else if (type->types & MS_TYPE_FIXTUPLE) {
         return json_decode_fixtuple(self, type, path);
@@ -22004,6 +22292,18 @@ convert_seq(
         return convert_seq_to_vartuple(
             self, items, size, TypeNode_get_array(type), path
         );
+    }
+    else if (type->types & MS_TYPE_FIXTUPLE_UNION) {
+        TypeNode *branch = TypeNode_select_fixtuple_union(
+            type, size, size ? ms_convert_wire_kind(items[0]) : 0
+        );
+        if (MS_UNLIKELY(branch == NULL)) {
+            ms_raise_validation_error(
+                path, "Expected array matching a supported tuple shape, got length %zd%U", size
+            );
+            return NULL;
+        }
+        return convert_seq_to_fixtuple(self, items, size, branch, path);
     }
     else if (type->types & MS_TYPE_FIXTUPLE) {
         return convert_seq_to_fixtuple(self, items, size, type, path);
