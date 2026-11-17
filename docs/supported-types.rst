@@ -1450,7 +1450,14 @@ Union restrictions are as follows:
 
 - Unions may contain at most one type that encodes to an array (`list`,
   `tuple`, `set`, `frozenset`, `typing.NamedTuple`, `Struct` with
-  ``array_like=True``).
+  ``array_like=True``), **except** a union of fixed-length `tuple` types
+  (optionally also ``None``). These can be decoded together when their lengths
+  are distinct, or when equal-length tuples have disjoint encoded types in
+  their first position. For example, ``tuple[int, int] | tuple[str, str]``
+  works because the first item is either a number or a string; however,
+  ``tuple[int] | tuple[float]`` is ambiguous because both start with an
+  encoded number. The remaining tuple items are validated against their
+  respective types once the branch is chosen.
 
 - Unions may contain at most one *untagged* `Struct` type. Unions containing
   multiple struct types are only supported through :ref:`struct-tagged-unions`.
@@ -1476,6 +1483,15 @@ Union restrictions are as follows:
     Traceback (most recent call last):
       File "<stdin>", line 1, in <module>
     msgspec.ValidationError: Expected `int | str | array`, got `bool`
+
+Fixed-tuple unions also support nested arrays of distinct shapes::
+
+    >>> RGB = tuple[float, float, float]
+    >>> Border = RGB | tuple[RGB, RGB, RGB, RGB]
+    >>> msgspec.json.decode(b'[1.0, 2.0, 3.0]', type=Border)
+    (1.0, 2.0, 3.0)
+    >>> msgspec.json.decode(b'[[1, 2, 3], [4, 5, 6], [7, 8, 9], [1, 2, 3]]', type=Border)
+    ((1.0, 2.0, 3.0), (4.0, 5.0, 6.0), (7.0, 8.0, 9.0), (1.0, 2.0, 3.0))
 
 ``Raw``
 -------
