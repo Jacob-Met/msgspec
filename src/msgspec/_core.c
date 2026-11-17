@@ -3074,6 +3074,9 @@ typedef struct StructInfo {
     StructMetaObject *class;
 #ifdef Py_GIL_DISABLED
     _Atomic(uint8_t) initialized;
+    _Atomic(uint8_t) json_union_checked;
+#else
+    uint8_t json_union_checked;
 #endif
     TypeNode *types[];
 } StructInfo;
@@ -3505,6 +3508,193 @@ TypeNode_traverse(TypeNode *self, visitproc visit, void *arg) {
         if ((out = TypeNode_traverse(node, visit, arg)) != 0) return out;
     }
     return 0;
+}
+
+/* JSON cannot disambiguate string and binary variants. Check the compiled
+ * type tree, including cached Struct schemas, without changing MessagePack's
+ * disjoint wire-type dispatch. Track recursive types to prevent cycles. */
+static int TypeNode_check_json_binary_union(TypeNode *, PyObject **, PyObject *);
+
+static int
+TypeNode_mark_json_seen(PyObject **seen, PyObject *obj) {
+    if (*seen == NULL) {
+        *seen = PySet_New(NULL);
+        if (*seen == NULL) return -1;
+    }
+    int contains = PySet_Contains(*seen, obj);
+    if (contains == 0 && PySet_Add(*seen, obj) < 0) return -1;
+    return contains;
+}
+
+static int
+TypeNode_check_json_struct(StructInfo *info, PyObject **seen, PyObject *context) {
+    int contains = TypeNode_mark_json_seen(seen, (PyObject *)info);
+    if (contains != 0) return contains < 0 ? -1 : 0;
+#ifdef Py_GIL_DISABLED
+    if (!atomic_load(&info->initialized)) {
+        Py_BEGIN_ALLOW_THREADS
+        while (!atomic_load(&info->initialized)) {}
+        Py_END_ALLOW_THREADS
+    }
+#endif
+    for (Py_ssize_t i = 0; i < Py_SIZE(info); i++) {
+        if (info->types[i] != NULL &&
+            TypeNode_check_json_binary_union(info->types[i], seen, context) < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int
+TypeNode_check_json_binary_union(TypeNode *type, PyObject **seen, PyObject *context) {
+    uint64_t types = type->types;
+    if (
+        (types & (MS_TYPE_STR | MS_TYPE_STRLITERAL | MS_TYPE_ENUM |
+                  MS_TYPE_DATETIME | MS_TYPE_DATE | MS_TYPE_TIME |
+                  MS_TYPE_TIMEDELTA | MS_TYPE_DECIMAL)) &&
+        (types & (MS_TYPE_BYTES | MS_TYPE_BYTEARRAY | MS_TYPE_MEMORYVIEW))
+    ) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "Type unions containing both string and binary types are ambiguous "
+            "in JSON - type `%R` is not supported",
+            context
+        );
+        return -1;
+    }
+
+    if (types & (MS_TYPE_STRUCT | MS_TYPE_STRUCT_ARRAY)) {
+        StructInfo *info = TypeNode_get_struct_info(type);
+        if (TypeNode_check_json_struct(info, seen, context) < 0) return -1;
+    }
+    else if (types & (MS_TYPE_STRUCT_UNION | MS_TYPE_STRUCT_ARRAY_UNION)) {
+        Lookup *lookup = (Lookup *)TypeNode_get_struct_union(type);
+        if (Lookup_IsStrLookup((PyObject *)lookup)) {
+            StrLookup *lk = (StrLookup *)lookup;
+            for (Py_ssize_t i = 0; i < Py_SIZE(lk); i++) {
+                if (lk->table[i].value != NULL &&
+                    TypeNode_check_json_struct(
+                        (StructInfo *)lk->table[i].value, seen, context
+                    ) < 0) return -1;
+            }
+        }
+        else {
+            IntLookup *lk = (IntLookup *)lookup;
+            if (lk->compact) {
+                IntLookupCompact *tbl = (IntLookupCompact *)lk;
+                for (Py_ssize_t i = 0; i < Py_SIZE(tbl); i++) {
+                    if (tbl->table[i] != NULL &&
+                        TypeNode_check_json_struct(
+                            (StructInfo *)tbl->table[i], seen, context
+                        ) < 0) return -1;
+                }
+            }
+            else {
+                IntLookupHashmap *tbl = (IntLookupHashmap *)lk;
+                for (Py_ssize_t i = 0; i < Py_SIZE(tbl); i++) {
+                    if (tbl->table[i].value != NULL &&
+                        TypeNode_check_json_struct(
+                            (StructInfo *)tbl->table[i].value, seen, context
+                        ) < 0) return -1;
+                }
+            }
+        }
+    }
+    else if (types & MS_TYPE_TYPEDDICT) {
+        TypedDictInfo *info = TypeNode_get_typeddict_info(type);
+        int contains = TypeNode_mark_json_seen(seen, (PyObject *)info);
+        if (contains < 0) return -1;
+        if (!contains) {
+            for (Py_ssize_t i = 0; i < Py_SIZE(info); i++) {
+                if (info->fields[i].type != NULL &&
+                    TypeNode_check_json_binary_union(
+                        info->fields[i].type, seen, context
+                    ) < 0) return -1;
+            }
+        }
+    }
+    else if (types & MS_TYPE_DATACLASS) {
+        DataclassInfo *info = TypeNode_get_dataclass_info(type);
+        int contains = TypeNode_mark_json_seen(seen, (PyObject *)info);
+        if (contains < 0) return -1;
+        if (!contains) {
+            for (Py_ssize_t i = 0; i < Py_SIZE(info); i++) {
+                if (info->fields[i].type != NULL &&
+                    TypeNode_check_json_binary_union(
+                        info->fields[i].type, seen, context
+                    ) < 0) return -1;
+            }
+        }
+    }
+    else if (types & MS_TYPE_NAMEDTUPLE) {
+        NamedTupleInfo *info = TypeNode_get_namedtuple_info(type);
+        int contains = TypeNode_mark_json_seen(seen, (PyObject *)info);
+        if (contains < 0) return -1;
+        if (!contains) {
+            for (Py_ssize_t i = 0; i < Py_SIZE(info); i++) {
+                if (info->types[i] != NULL &&
+                    TypeNode_check_json_binary_union(
+                        info->types[i], seen, context
+                    ) < 0) return -1;
+            }
+        }
+    }
+
+    Py_ssize_t n_obj, n_type, ft_offset, ft_size;
+    TypeNode_get_traverse_ranges(type, &n_obj, &n_type, &ft_offset, &ft_size);
+    for (Py_ssize_t i = n_obj; i < n_obj + n_type; i++) {
+        if (TypeNode_check_json_binary_union(
+                type->details[i].pointer, seen, context
+            ) < 0) return -1;
+    }
+    for (Py_ssize_t i = 0; i < ft_size; i++) {
+        if (TypeNode_check_json_binary_union(
+                type->details[i + ft_offset].pointer, seen, context
+            ) < 0) return -1;
+    }
+    return 0;
+}
+
+static int
+TypeNode_check_json(TypeNode *type, PyObject *context) {
+    StructInfo *struct_info = NULL;
+    if (type->types & (MS_TYPE_STRUCT | MS_TYPE_STRUCT_ARRAY)) {
+        struct_info = TypeNode_get_struct_info(type);
+#ifdef Py_GIL_DISABLED
+        if (atomic_load(&struct_info->json_union_checked)) return 0;
+#else
+        if (struct_info->json_union_checked) return 0;
+#endif
+    }
+    else if (!(type->types & (
+            MS_TYPE_STRUCT_UNION | MS_TYPE_STRUCT_ARRAY_UNION |
+            MS_TYPE_TYPEDDICT | MS_TYPE_DATACLASS | MS_TYPE_NAMEDTUPLE |
+            MS_ANY_DICT | MS_TYPE_LIST | MS_TYPE_SET | MS_TYPE_FROZENSET |
+            MS_TYPE_VARTUPLE | MS_TYPE_FIXTUPLE
+        )) && !(
+            (type->types & (
+                MS_TYPE_STR | MS_TYPE_STRLITERAL | MS_TYPE_ENUM |
+                MS_TYPE_DATETIME | MS_TYPE_DATE | MS_TYPE_TIME |
+                MS_TYPE_TIMEDELTA | MS_TYPE_DECIMAL
+            )) &&
+            (type->types & (MS_TYPE_BYTES | MS_TYPE_BYTEARRAY | MS_TYPE_MEMORYVIEW))
+        )) {
+        /* Unambiguous scalar unions have no nested type tree to inspect. */
+        return 0;
+    }
+
+    PyObject *seen = NULL;
+    int result = TypeNode_check_json_binary_union(type, &seen, context);
+    Py_XDECREF(seen);
+    if (result == 0 && struct_info != NULL) {
+#ifdef Py_GIL_DISABLED
+        atomic_store(&struct_info->json_union_checked, 1);
+#else
+        struct_info->json_union_checked = 1;
+#endif
+    }
+    return result;
 }
 
 static PyObject *
@@ -4260,11 +4450,10 @@ typenode_collect_check_invariants(TypeNodeCollectState *state) {
         return -1;
     }
 
-    /* Ensure str-like types don't conflict */
+    /* MessagePack uses separate wire types for strings and binary data. */
     if (ms_popcount(
             state->types & (
                 MS_TYPE_STR | MS_TYPE_STRLITERAL | MS_TYPE_ENUM |
-                MS_TYPE_BYTES | MS_TYPE_BYTEARRAY | MS_TYPE_MEMORYVIEW |
                 MS_TYPE_DATETIME | MS_TYPE_DATE | MS_TYPE_TIME |
                 MS_TYPE_TIMEDELTA | MS_TYPE_UUID | MS_TYPE_DECIMAL
             )
@@ -4273,8 +4462,25 @@ typenode_collect_check_invariants(TypeNodeCollectState *state) {
         PyErr_Format(
             PyExc_TypeError,
             "Type unions may not contain more than one str-like type (`str`, "
-            "`Enum`, `Literal[str values]`, `datetime`, `date`, `time`, `timedelta`, "
-            "`uuid`, `decimal`, `bytes`, `bytearray`) - type `%R` is not supported",
+            "`Enum`, `Literal[str values]`, `datetime`, `date`, `time`, "
+            "`timedelta`, `uuid`, `decimal`) - type `%R` is not supported",
+            state->context
+        );
+        return -1;
+    }
+    /* UUIDs may arrive as either text or binary; they conflict with both. */
+    if (ms_popcount(
+            state->types & (
+                MS_TYPE_BYTES | MS_TYPE_BYTEARRAY | MS_TYPE_MEMORYVIEW |
+                MS_TYPE_UUID
+            )
+        ) > 1
+    ) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "Type unions may not contain more than one bytes-like type "
+            "(`bytes`, `bytearray`, `memoryview`, `uuid`) - "
+            "type `%R` is not supported",
             state->context
         );
         return -1;
@@ -7204,6 +7410,11 @@ StructInfo_Convert_lock_held(PyObject *obj) {
 #endif
     Py_INCREF(class);
     info->class = class;
+#ifdef Py_GIL_DISABLED
+    atomic_store(&info->json_union_checked, 0);
+#else
+    info->json_union_checked = 0;
+#endif
 
     /* Cache the new StuctInfo on the original type annotation */
     if (is_struct) {
@@ -17391,6 +17602,7 @@ JSONDecoder_init(JSONDecoder *self, PyObject *args, PyObject *kwds)
     /* Handle type */
     self->type = TypeNode_Convert(type);
     if (self->type == NULL) return -1;
+    if (TypeNode_check_json(self->type, type) < 0) return -1;
     Py_INCREF(type);
     self->orig_type = type;
 
@@ -20318,6 +20530,16 @@ msgspec_json_decode(PyObject *self, PyObject *const *args, Py_ssize_t nargs, PyO
     else {
         state.type = TypeNode_Convert(type);
         if (state.type == NULL) return NULL;
+    }
+
+    if (TypeNode_check_json(state.type, type) < 0) {
+        if (state.type == (TypeNode *)&typenode_struct) {
+            Py_DECREF(typenode_struct.details[0].pointer);
+        }
+        else if (state.type != &typenode_any) {
+            TypeNode_Free(state.type);
+        }
+        return NULL;
     }
 
     Py_buffer buffer;
